@@ -8,7 +8,7 @@ on:
     
 jobs:
   CodeQL-Build:
-    runs-on: windows-latest
+    runs-on: windows-latest-l
     permissions:
       security-events: write
       packages: read
