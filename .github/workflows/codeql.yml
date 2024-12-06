@@ -33,8 +33,9 @@ jobs:
         build-mode: ${{ matrix.build-mode }}
         config-file: ./.github/codeql/codeql-config.yml
         queries: security-extended
-          
-    - run: |
+        
+    - if: matrix.build-mode == 'manual'  
+      run: |
         echo "Run Umbraco-CMS build"
         pwsh -command .\build\build.ps1
 
