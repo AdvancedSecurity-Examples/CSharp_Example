@@ -1,0 +1,141 @@
+name: Generate and Upload SBOM
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  generate-sbom:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x' # Adjust version as needed
+
+      - name: Get .NET version
+        id: dotnet-version
+        run: |
+          DOTNET_VERSION=$(dotnet --version)
+          echo "version=$DOTNET_VERSION" >> $GITHUB_OUTPUT
+          echo ".NET Version: $DOTNET_VERSION"
+
+      - name: Extract project .NET target framework
+        id: project-version
+        run: |
+          # Find the first .csproj file and extract TargetFramework
+          FRAMEWORK=$(find . -name "*.csproj" -type f | head -1 | xargs grep -oP '(?<=<TargetFramework>)[^<]+' | head -1)
+          echo "framework=$FRAMEWORK" >> $GITHUB_OUTPUT
+          echo "Project Target Framework: $FRAMEWORK"
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          dotnet tool install --global CycloneDX
+          cyclonedx -o . -t json -f sbom.json
+
+      - name: Create enhanced SBOM with .NET metadata
+        id: enhance-sbom
+        run: |
+          python3 << 'EOF'
+          import json
+          
+          # Read the generated SBOM
+          with open('sbom.json', 'r') as f:
+              sbom = json.load(f)
+          
+          # Add metadata with .NET version information
+          if 'metadata' not in sbom:
+              sbom['metadata'] = {}
+          
+          sbom['metadata']['component'] = {
+              "type": "application",
+              "name": "CSharp_Example",
+              "properties": [
+                  {
+                      "name": "dotnet:runtime-version",
+                      "value": "${{ steps.dotnet-version.outputs.version }}"
+                  },
+                  {
+                      "name": "dotnet:target-framework",
+                      "value": "${{ steps.project-version.outputs.framework }}"
+                  }
+              ]
+          }
+          
+          # Write enhanced SBOM
+          with open('sbom-enhanced.json', 'w') as f:
+              json.dump(sbom, f, indent=2)
+          
+          print("Enhanced SBOM created with .NET metadata")
+          EOF
+
+      - name: Generate SBOM via GitHub API (Dependency Graph)
+        run: |
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }}/dependency-graph/snapshots \
+            -d @- << EOF
+          {
+            "version": 0,
+            "job": {
+              "correlator": "csharp-sbom-${{ github.run_id }}",
+              "id": "${{ github.run_id }}"
+            },
+            "manifests": {
+              "packages.lock.json": {
+                "file": {
+                  "source_location": "packages.lock.json"
+                }
+              }
+            }
+          }
+          EOF
+
+      - name: Upload SBOM as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom-enhanced.json
+          retention-days: 90
+
+      - name: Upload SBOM to GitHub Releases (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-release
+          path: sbom-enhanced.json
+
+      - name: Create SBOM summary
+        run: |
+          echo "## SBOM Generation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Runtime Version**: ${{ steps.dotnet-version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target Framework**: ${{ steps.project-version.outputs.framework }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Artifact**: sbom-enhanced.json" >> $GITHUB_STEP_SUMMARY
+          echo "- **Format**: CycloneDX JSON" >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment PR with SBOM info
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 📦 SBOM Generated\n\n- **Runtime Version**: ${{ steps.dotnet-version.outputs.version }}\n- **Target Framework**: ${{ steps.project-version.outputs.framework }}\n\nSBOM artifact available in the workflow run.`
+            })
